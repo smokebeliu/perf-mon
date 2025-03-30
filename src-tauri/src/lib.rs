@@ -1,10 +1,13 @@
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use lazy_static::lazy_static;
 use reqwest::Client;
 use serde::Serialize;
 use std::env;
+use std::io::Write;
 use std::sync::Mutex;
 use std::time::SystemTime;
-use sysinfo::{CpuExt, PidExt, ProcessExt, System, SystemExt};
+use sysinfo::{CpuExt, NetworkExt, PidExt, ProcessExt, System, SystemExt};
 
 #[derive(Serialize, Clone)]
 pub struct ProcessInfo {
@@ -18,6 +21,9 @@ pub struct ProcessInfo {
 pub struct SystemInfo {
     pub name: String,
     pub hostname: String,
+    pub uptime: u64,
+    pub os_version: String,
+    pub kernel_version: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -29,12 +35,21 @@ pub struct MemoryInfo {
 }
 
 #[derive(Serialize, Clone)]
+pub struct NetworkInfo {
+    pub received_bytes: u64,
+    pub total_received_bytes: u64,
+    pub transmitted_bytes: u64,
+    pub total_transmitted_bytes: u64,
+}
+
+#[derive(Serialize, Clone)]
 pub struct PerfInfo {
     pub time: SystemTime,
     pub system: SystemInfo,
     pub cpu: Vec<f32>,
     pub memory: MemoryInfo,
     pub processes: Vec<ProcessInfo>,
+    pub networks: std::collections::HashMap<String, NetworkInfo>,
 }
 
 #[derive(Serialize)]
@@ -78,6 +93,9 @@ pub fn collect_perf_info() -> PerfInfo {
     let system_info = SystemInfo {
         name: system_name,
         hostname: system_hostname,
+        uptime: system.uptime(),
+        os_version: system.os_version().unwrap_or_default(),
+        kernel_version: system.kernel_version().unwrap_or_default(),
     };
     println!("Системная информация собрана");
 
@@ -126,6 +144,22 @@ pub fn collect_perf_info() -> PerfInfo {
         .collect();
     println!("Собрана информация о {} процессах", processes.len());
 
+    // Получаем информацию о сети
+    println!("Начинаем сбор информации о сети");
+    let mut networks = std::collections::HashMap::new();
+    for (interface_name, data) in system.networks() {
+        networks.insert(
+            interface_name.clone(),
+            NetworkInfo {
+                received_bytes: data.received(),
+                total_received_bytes: data.total_received(),
+                transmitted_bytes: data.transmitted(),
+                total_transmitted_bytes: data.total_transmitted(),
+            },
+        );
+    }
+    println!("Информация о сети собрана");
+
     // Собираем финальную структуру
     println!("Формируем итоговую структуру");
     PerfInfo {
@@ -134,6 +168,7 @@ pub fn collect_perf_info() -> PerfInfo {
         cpu: cpu_usage,
         memory: memory_info,
         processes: processes,
+        networks,
     }
 }
 
@@ -151,7 +186,23 @@ pub fn get_buffer_status() -> BufferStatus {
 // Обновляем функцию send_batch чтобы она увеличивала счетчик отправленных элементов
 pub async fn send_batch(batch: Vec<PerfInfo>) -> Result<(), reqwest::Error> {
     let client = Client::new();
+
+    // Сначала преобразуем данные в JSON
     let json = serde_json::to_string(&batch).expect("Ошибка сериализации данных в JSON");
+
+    // Создаем GZIP энкодер
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+
+    // Записываем JSON в энкодер
+    encoder
+        .write_all(json.as_bytes())
+        .expect("Ошибка сжатия данных");
+
+    // Получаем сжатые данные
+    let compressed_data = encoder.finish().expect("Ошибка финализации сжатия");
+
+    println!("Размер данных до сжатия: {} байт", json.len());
+    println!("Размер данных после сжатия: {} байт", compressed_data.len());
 
     let server_url =
         env::var("SERVER_URL").unwrap_or_else(|_| "http://yourserver.com/api/monitor".to_string());
@@ -159,7 +210,8 @@ pub async fn send_batch(batch: Vec<PerfInfo>) -> Result<(), reqwest::Error> {
     let response = client
         .post(&server_url)
         .header("Content-Type", "application/json")
-        .body(json)
+        .header("Content-Encoding", "gzip") // Важно указать, что данные сжаты
+        .body(compressed_data)
         .send()
         .await?;
 
