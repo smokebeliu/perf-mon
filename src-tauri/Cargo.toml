@@ -15,12 +15,17 @@ path = "src/lib.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+flate2 = "1.0"
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sysinfo = "0.28"             # Для получения информации о системе и процессах
-reqwest = { version = "0.11", features = ["json", "rustls-tls"] }  # Для HTTP-запросов
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sysinfo = "0.29"             # Для получения информации о системе и процессах
+reqwest = { version = "0.11", features = ["json"] }  # Для HTTP-запросов
 tokio = { version = "1", features = ["full"] }       # Для асинхронного выполнения
 lazy_static = "1.4"          # Для создания глобального буфера
 dotenv = "0.15"
+log = "0.4"
+simplelog = "0.12"
+chrono = "0.4"
+windows-service = { version = "0.6", features = ["register"] }

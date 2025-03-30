@@ -1,7 +1,14 @@
+use chrono::Local;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use lazy_static::lazy_static;
+use log::{error, info};
 use reqwest::Client;
 use serde::Serialize;
+use simplelog::{CombinedLogger, Config, LevelFilter, WriteLogger};
 use std::env;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::sync::Mutex;
 use std::time::SystemTime;
 use sysinfo::{CpuExt, PidExt, ProcessExt, System, SystemExt};
@@ -49,92 +56,80 @@ lazy_static! {
     pub static ref SYSTEM: Mutex<System> = Mutex::new(System::new_all());
     pub static ref DATA_BUFFER: Mutex<Vec<PerfInfo>> = Mutex::new(Vec::new());
     pub static ref TOTAL_SENT: Mutex<usize> = Mutex::new(0);
+    pub static ref LOGGING_ENABLED: bool = env::var("LOGGING")
+        .unwrap_or_else(|_| "false".to_string())
+        .parse()
+        .unwrap_or(false);
+}
+
+pub fn setup_logging() -> Result<(), Box<dyn std::error::Error>> {
+    if *LOGGING_ENABLED {
+        let log_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("perf_monitor.log")?;
+
+        CombinedLogger::init(vec![WriteLogger::new(
+            LevelFilter::Info,
+            Config::default(),
+            log_file,
+        )])?;
+
+        info!("Логирование инициализировано");
+    }
+    Ok(())
 }
 
 pub fn collect_perf_info() -> PerfInfo {
     let mut system = SYSTEM.lock().unwrap();
-    println!("Получен доступ к SYSTEM");
+    if *LOGGING_ENABLED {
+        info!("Получен доступ к SYSTEM");
+    }
 
     // Обновляем данные
-    println!("Обновление системных данных");
     system.refresh_all();
     system.refresh_cpu();
-    println!("Системные данные обновлены");
-
-    // Получаем время
-    let current_time = SystemTime::now();
-    println!("Текущее время получено");
-
-    // Получаем системную информацию
-    println!("Начинаем сбор системной информации");
-    let system_name = system.name().unwrap_or_else(|| {
-        println!("Не удалось получить имя системы");
-        String::from("Unknown")
-    });
-    let system_hostname = system.host_name().unwrap_or_else(|| {
-        println!("Не удалось получить hostname");
-        String::from("Unknown")
-    });
-    let system_info = SystemInfo {
-        name: system_name,
-        hostname: system_hostname,
-    };
-    println!("Системная информация собрана");
-
-    // Получаем информацию о CPU
-    println!("Начинаем сбор информации о CPU");
-    let cpu_usage: Vec<f32> = system.cpus().iter().map(|cpu| cpu.cpu_usage()).collect();
-    println!("Собрана информация о {} CPU ядрах", cpu_usage.len());
-
-    // Получаем информацию о памяти
-    println!("Начинаем сбор информации о памяти");
-    let memory_info = MemoryInfo {
-        total: system.total_memory(),
-        used: system.used_memory(),
-        total_swap: system.total_swap(),
-        used_swap: system.used_swap(),
-    };
-    println!("Информация о памяти собрана");
-
-    // Получаем информацию о процессах
-    println!("Начинаем сбор информации о процессах");
-    let processes: Vec<ProcessInfo> = system
-        .processes()
-        .iter()
-        .filter_map(|(pid, process)| {
-            let result = std::panic::catch_unwind(|| ProcessInfo {
-                pid: pid.as_u32() as i32,
-                name: process.name().to_string(),
-                cpu_usage: process.cpu_usage(),
-                memory: process.memory(),
-            });
-
-            match result {
-                Ok(proc_info) => {
-                    println!(
-                        "Успешно обработан процесс: {} (PID: {})",
-                        proc_info.name, proc_info.pid
-                    );
-                    Some(proc_info)
-                }
-                Err(_) => {
-                    println!("Ошибка при обработке процесса с PID: {}", pid.as_u32());
-                    None
-                }
-            }
-        })
-        .collect();
-    println!("Собрана информация о {} процессах", processes.len());
-
-    // Собираем финальную структуру
-    println!("Формируем итоговую структуру");
-    PerfInfo {
-        time: current_time,
-        system: system_info,
-        cpu: cpu_usage,
-        memory: memory_info,
-        processes: processes,
+    if *LOGGING_ENABLED {
+        info!("Системные данные обновлены");
     }
+
+    let perf_info = PerfInfo {
+        time: SystemTime::now(),
+        system: SystemInfo {
+            name: system.name().unwrap_or_default(),
+            hostname: system.host_name().unwrap_or_default(),
+        },
+        cpu: system.cpus().iter().map(|cpu| cpu.cpu_usage()).collect(),
+        memory: MemoryInfo {
+            total: system.total_memory(),
+            used: system.used_memory(),
+            total_swap: system.total_swap(),
+            used_swap: system.used_swap(),
+        },
+        processes: system
+            .processes()
+            .iter()
+            .filter_map(|(pid, process)| {
+                std::panic::catch_unwind(|| ProcessInfo {
+                    pid: pid.as_u32() as i32,
+                    name: process.name().to_string(),
+                    cpu_usage: process.cpu_usage(),
+                    memory: process.memory(),
+                })
+                .ok()
+            })
+            .collect(),
+    };
+
+    if *LOGGING_ENABLED {
+        info!(
+            "Собрана информация: {} процессов, {} ядер CPU",
+            perf_info.processes.len(),
+            perf_info.cpu.len()
+        );
+    }
+
+    perf_info
 }
 
 pub fn get_buffer_status() -> BufferStatus {
@@ -153,21 +148,40 @@ pub async fn send_batch(batch: Vec<PerfInfo>) -> Result<(), reqwest::Error> {
     let client = Client::new();
     let json = serde_json::to_string(&batch).expect("Ошибка сериализации данных в JSON");
 
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(json.as_bytes())
+        .expect("Ошибка сжатия данных");
+    let compressed_data = encoder.finish().expect("Ошибка финализации сжатия");
+
+    if *LOGGING_ENABLED {
+        info!(
+            "Подготовлены данные для отправки: {} -> {} байт",
+            json.len(),
+            compressed_data.len()
+        );
+    }
+
     let server_url =
         env::var("SERVER_URL").unwrap_or_else(|_| "http://yourserver.com/api/monitor".to_string());
 
     let response = client
         .post(&server_url)
         .header("Content-Type", "application/json")
-        .body(json)
+        .header("Content-Encoding", "gzip")
+        .body(compressed_data)
         .send()
         .await?;
 
     if response.status().is_success() {
         let mut total = TOTAL_SENT.lock().unwrap();
         *total += batch.len();
+        if *LOGGING_ENABLED {
+            info!("Пакет успешно отправлен, всего: {}", *total);
+        }
+    } else if *LOGGING_ENABLED {
+        error!("Ошибка отправки: {}", response.status());
     }
 
-    println!("Пакет отправлен, статус: {}", response.status());
     Ok(())
 }
